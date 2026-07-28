@@ -1,3 +1,11 @@
+# Diagnose-Ausgaben.
+# NIEMALS committen: enthalten Job-, VM- und Hostnamen aus Kundenumgebungen.
+# Das Repository ist oeffentlich.
+veeam-diagnose.txt
+*diagnose*.txt
+*diagnose*.log
+*.log
+
 # Windows / OneDrive
 Thumbs.db
 desktop.ini

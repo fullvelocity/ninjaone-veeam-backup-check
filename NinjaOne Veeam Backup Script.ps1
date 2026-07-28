@@ -118,8 +118,11 @@ $VeeamCheckLogic = @'
     # "&quot;") und mit eingebetteten Zeilenumbruechen. Beides wuerde das Log
     # unleserlich machen und unnoetig Zeichen vom 10.000er-Budget fressen.
     # Ergebnis: eine einzeilige, entschaerfte Meldung, hart auf $MaxLen gekappt.
+    # MaxLen 400: Veeam-Meldungen sind lang. Der Reinigungshinweis eines
+    # Bandlaufwerks braucht allein rund 250 Zeichen, davor steht noch der Titel.
+    # Bei 260 waere genau die Handlungsanweisung abgeschnitten worden.
     function Format-Msg {
-        param([string]$Text, [int]$MaxLen = 260)
+        param([string]$Text, [int]$MaxLen = 400)
         if ([string]::IsNullOrEmpty($Text)) { return "" }
         $t = $Text
         $t = $t -replace '<br\s*/?>', ' '
@@ -349,7 +352,14 @@ $VeeamCheckLogic = @'
     # Teil ihres Elternjobs und haben deshalb NIE eine eigene abgeschlossene
     # Session. Ohne diesen Filter flutet das Log mit Zeilen wie
     # "GL-DC-01 Backup | Keine abgeschlossene Session gefunden" - im Praxistest
-    # waren das 22 Zeilen fuer einen einzigen Proxmox-Job.
+    # waren das 22 von 24 Jobs.
+    #
+    # Die Marker sind am Diagnoselauf auf VBR 13.0.2 verifiziert:
+    #   - die 22 Pro-VM-Jobs (TypeToString "Proxmox Agent Backup") tragen alle
+    #     dieselbe ParentJobId und IsChildJob = True
+    #   - die 2 Copy-Kindjobs heissen "Elternjob\Kindjob", haben aber KEINE
+    #     ParentJobId - deshalb ist die Namenspruefung noetig
+    #   - die 2 echten Jobs (TypeToString "Proxmox Backup") tragen keinen Marker
     function Test-IsChildJob {
         param($Job)
         if ($null -eq $Job) { return $false }
@@ -363,8 +373,12 @@ $VeeamCheckLogic = @'
             if ($parentId -and $parentId -ne "00000000-0000-0000-0000-000000000000") { return $true }
         } catch {}
 
-        # c) Explizites Kind-Flag, je nach Version unterschiedlich vorhanden
-        try { if ($Job.IsChild -eq $true) { return $true } } catch {}
+        # c) Explizite Kind-Flags. Welches davon existiert, haengt an der
+        #    Version - auf V13 ist es IsChildJob, IsChild ist dort $null.
+        try { if ($Job.IsChildJob       -eq $true) { return $true } } catch {}
+        try { if ($Job.IsChildWorkerJob -eq $true) { return $true } } catch {}
+        try { if ($Job.HasParent        -eq $true) { return $true } } catch {}
+        try { if ($Job.IsChild          -eq $true) { return $true } } catch {}
 
         return $false
     }
@@ -759,6 +773,20 @@ $VeeamCheckLogic = @'
                     if (-not $lastCSession) {
                         try {
                             $lastCSession = Invoke-WithRetry -Command { Get-VBRBackupSession -Name $cJobName -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Stopped" } | Sort-Object CreationTime -Descending | Select-Object -First 1 }
+                        } catch {}
+                    }
+
+                    # Dritter Versuch ueber die Core-Klasse.
+                    # Noetig bei Copy-Jobs auf Plattform-Basis (Proxmox): dort
+                    # finden beide Cmdlets nichts, weil die Sessions an den
+                    # internen Kindjobs "Elternjob\Kindjob" haengen. Ohne das
+                    # meldete der Job nur "Success (Job-Status)" ohne Zeitpunkt -
+                    # und im Warnfall entsprechend ohne jede Ursache.
+                    if (-not $lastCSession) {
+                        try {
+                            $coreCopyJob = @([Veeam.Backup.Core.CBackupJob]::GetAll() |
+                                             Where-Object { "$($_.Name)" -eq "$cJobName" })[0]
+                            if ($coreCopyJob) { $lastCSession = $coreCopyJob.FindLastSession() }
                         } catch {}
                     }
 
