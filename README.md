@@ -81,6 +81,21 @@ Das Script muss auf die Felder Schreibrechte haben.
 3. Einen Zeitplan setzen, der nach dem Backup-Fenster liegt.
 4. Conditions auf `veeamfail = 1` bzw. `veeamwarning = 1` aufbauen.
 
+## Diagnose
+
+`Diagnose-VeeamLog.ps1` aendert nichts und schreibt keine Felder. Es gibt auf der
+Konsole aus, welche Objekte und Properties die installierte Veeam-Version
+tatsaechlich liefert - hilfreich, wenn bei einem Job zwar der Status, aber keine
+Detailmeldung ankommt.
+
+```
+powershell -ExecutionPolicy Bypass -File .\Diagnose-VeeamLog.ps1
+```
+
+Bei Veeam V13 stattdessen mit `pwsh`. Geprueft werden unter anderem: woher die
+Meldung eines Tape-Jobs kommt (`.Log`, `.Logger.GetLog()`, `GetDetails()`,
+`Info.Reason`) und woran sich interne Kind-Jobs erkennen lassen.
+
 ## Bekannte Einschraenkungen
 
 * **Geraet offline:** Ist die Maschine zum Ausfuehrungszeitpunkt aus, laeuft das

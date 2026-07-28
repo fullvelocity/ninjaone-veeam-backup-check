@@ -188,7 +188,7 @@ $VeeamCheckLogic = @'
 
         if ($null -eq $Obj) { return ,$out }
 
-        # --- 1) Logger-Records: hier steht die Ursache im Klartext ------------
+        # --- 1a) Interner Logger: Core-Sessions und TaskSessions --------------
         $records = $null
         try {
             $log = $Obj.Logger.GetLog()
@@ -201,6 +201,20 @@ $VeeamCheckLogic = @'
                 }
             }
         } catch {}
+
+        # --- 1b) .Log-Property: Tape-Sessions und M365 ------------------------
+        # Get-VBRTapeBackupSession liefert ein VBRTapeBackupSession-Objekt, das
+        # KEIN Logger-Objekt hat, sondern eine fertige Record-Liste unter .Log
+        # (laut Veeam-Doku: Progress, RunManually, Log, Initiator, ...).
+        # Genau daran lag es, dass beim Tape-Job nur "Warning" ohne Text ankam:
+        # 1a lief ins Leere und es gab keine zweite Quelle.
+        if (-not $records) {
+            try {
+                $records = @($Obj.Log | Where-Object {
+                    $_ -and $null -ne $_.Title -and "$($_.Status)" -match 'Warning|Failed|Error'
+                })
+            } catch {}
+        }
 
         # Title = Kurzmeldung, Description = Zusatzinfo. Beide zusammengefuehrt,
         # weil die eigentliche Ursache mal im einen, mal im anderen Feld steht.
@@ -279,8 +293,15 @@ $VeeamCheckLogic = @'
         param($Obj, [int]$Count = 3)
         $out = New-Object System.Collections.Generic.List[string]
         if ($null -eq $Obj) { return ,$out }
+
+        # Beide Quellen wie in Get-DetailMessages: Logger (Core) und .Log (Tape/M365)
+        $recs = @()
+        try { $recs = @($Obj.Logger.GetLog().UpdatedRecords) } catch {}
+        if ($recs.Count -eq 0) {
+            try { $recs = @($Obj.Log | Where-Object { $_ -and $null -ne $_.Title }) } catch {}
+        }
+
         try {
-            $recs = @($Obj.Logger.GetLog().UpdatedRecords)
             $start = 0
             if ($recs.Count -gt $Count) { $start = $recs.Count - $Count }
             for ($i = $start; $i -lt $recs.Count; $i++) {
@@ -289,6 +310,63 @@ $VeeamCheckLogic = @'
             }
         } catch {}
         return ,$out
+    }
+
+    # Holt zu einer "leichten" Session das vollstaendige Core-Objekt.
+    #
+    # Mehrere Cmdlets (Get-VBRTapeBackupSession, Get-VBRSession) geben Wrapper
+    # zurueck, denen der Logger fehlt. Ueber die Session-Id laesst sich dieselbe
+    # Session als vollwertiges Objekt nachladen - der Weg, der beim Proxmox-
+    # Abschnitt nachweislich funktioniert. Findet sich nichts Besseres, kommt
+    # das Original unveraendert zurueck.
+    function Resolve-FullSession {
+        param($Session)
+        if ($null -eq $Session) { return $null }
+
+        # Hat das Objekt bereits einen brauchbaren Logger? Dann nichts tun.
+        try { if ($Session.Logger -and $Session.Logger.GetLog()) { return $Session } } catch {}
+
+        $sid = $null
+        try { $sid = $Session.Id } catch {}
+        if (-not $sid) { return $Session }
+
+        try {
+            $f = Get-VBRBackupSession -Id $sid -ErrorAction SilentlyContinue
+            if ($f) { return $f }
+        } catch {}
+        try {
+            $f = [Veeam.Backup.Core.CBackupSession]::Get($sid)
+            if ($f) { return $f }
+        } catch {}
+
+        return $Session
+    }
+
+    # Erkennt interne Kind-Jobs, die Veeam pro VM bzw. pro Copy-Ziel anlegt.
+    #
+    # [Veeam.Backup.Core.CBackupJob]::GetAll() liefert auch diese Jobs mit,
+    # obwohl sie keine eigenstaendigen Jobs sind: sie laufen ausschliesslich als
+    # Teil ihres Elternjobs und haben deshalb NIE eine eigene abgeschlossene
+    # Session. Ohne diesen Filter flutet das Log mit Zeilen wie
+    # "GL-DC-01 Backup | Keine abgeschlossene Session gefunden" - im Praxistest
+    # waren das 22 Zeilen fuer einen einzigen Proxmox-Job.
+    function Test-IsChildJob {
+        param($Job)
+        if ($null -eq $Job) { return $false }
+
+        # a) Kinder von Copy-Jobs heissen "Elternjob\Kindjob"
+        try { if ("$($Job.Name)" -match '\\') { return $true } } catch {}
+
+        # b) Gesetzte ParentJobId (leere GUID = kein Elternteil)
+        try {
+            $parentId = "$($Job.ParentJobId)"
+            if ($parentId -and $parentId -ne "00000000-0000-0000-0000-000000000000") { return $true }
+        } catch {}
+
+        # c) Explizites Kind-Flag, je nach Version unterschiedlich vorhanden
+        try { if ($Job.IsChild -eq $true) { return $true } } catch {}
+
+        return $false
     }
 
     # Schreibt eine Meldungsliste eingerueckt ins Log
@@ -453,10 +531,14 @@ $VeeamCheckLogic = @'
         #   - in Weg A nur ergaenzend, um IsScheduleEnabled pruefen zu koennen
         #     (die Session allein sagt nichts darueber aus, ob der Job noch aktiv ist)
         # Schlaegt der Zugriff fehl, bleibt die Liste leer und Weg A traegt allein.
+        # Test-IsChildJob filtert die internen Pro-VM- und Copy-Kindjobs weg,
+        # die GetAll() ungefragt mitliefert (siehe Funktionskommentar oben).
         $platformJobs = @()
         try {
             $platformJobs = @([Veeam.Backup.Core.CBackupJob]::GetAll() | Where-Object {
                 "$($_.TypeToString)" -match 'Proxmox|Nutanix|AHV|oVirt|RHV|OLVM|Scale Computing|Morpheus'
+            } | Where-Object {
+                -not (Test-IsChildJob -Job $_)
             })
         } catch {}
 
@@ -564,6 +646,9 @@ $VeeamCheckLogic = @'
             if ([string]::IsNullOrEmpty($platformName) -and $pjob) {
                 try { $platformName = [string]$pjob.TypeToString } catch {}
             }
+            # Trim, weil TypeToString teils mit Leerzeichen endet - sonst steht
+            # im Log "Proxmox -Job:" statt "Proxmox VE-Job:"
+            $platformName = "$platformName".Trim()
             if ([string]::IsNullOrEmpty($platformName)) { $platformName = "Platform" }
 
             $jobStatus = Get-StatusString -Obj $session
@@ -612,6 +697,13 @@ $VeeamCheckLogic = @'
         # Wichtig fuer den haeufigsten Praxisfall: Proxmox-Job frisch angelegt,
         # Zeitplan falsch gesetzt, noch nie gelaufen. Ohne diese Schleife stuende
         # dazu nichts im Log und der Job faellt schlicht nicht auf.
+        #
+        # Deckel bei 5 Zeilen: Kindjobs sind zwar oben herausgefiltert, aber falls
+        # eine Veeam-Version die Erkennung umgeht, soll das Log nicht zulaufen und
+        # dabei die wichtigen Fehlermeldungen aus dem Zeichenlimit draengen.
+        # Die Restanzahl wird ausgewiesen, damit nichts stillschweigend verschwindet.
+        $noSessionTotal = 0
+        $noSessionShown = 0
         foreach ($pj in $platformJobs) {
             $pName = ""
             try { $pName = [string]$pj.Name } catch {}
@@ -620,11 +712,19 @@ $VeeamCheckLogic = @'
             if ($HandledJobNames.ContainsKey("$pName")) { continue }
             if ($pj.IsScheduleEnabled -eq $false) { continue }
 
+            $noSessionTotal++
+            if ($noSessionShown -ge 5) { continue }
+
             $pType = "Platform"
-            try { $pType = [string]$pj.TypeToString } catch {}
+            try { $pType = "$($pj.TypeToString)".Trim() } catch {}
+            if ([string]::IsNullOrEmpty($pType)) { $pType = "Platform" }
 
             Add-Log "--------------------------------------"
             Add-Log "$pType-Job: $pName | Status: Keine abgeschlossene Session gefunden."
+            $noSessionShown++
+        }
+        if ($noSessionTotal -gt $noSessionShown) {
+            Add-Log "[... $($noSessionTotal - $noSessionShown) weitere Platform-Jobs ohne abgeschlossene Session]"
         }
 
         if ($platformSessions.Count -eq 0 -and $platformJobs.Count -eq 0) {
@@ -865,12 +965,24 @@ $VeeamCheckLogic = @'
                         # mehrere zusammenhaengende Meldungen produziert
                         # (Medium fehlt -> Pool leer -> Job abgebrochen).
                         if ("$tapeStatus" -ne "Success") {
+
+                            # Reihenfolge der Versuche, vom Wahrscheinlichsten abwaerts:
+                            #   1. Wrapper-Objekt direkt (.Log-Property)
+                            #   2. dieselbe Session als volles Core-Objekt (.Logger)
+                            #   3. letzte Session des Jobs ueber die Core-Klasse
+                            #   4. letzte Log-Zeilen ohne Statusfilter
+                            # Ein einzelner Weg reicht nicht: welches Objekt
+                            # Get-VBRTapeBackupSession zurueckgibt, haengt an der
+                            # Veeam-Version.
                             $tapeMsgs = @(Get-DetailMessages -Obj $latestSession -Max 6)
 
-                            # Fallback: Get-VBRTapeBackupSession liefert je nach
-                            # Version ein Wrapper-Objekt OHNE Logger. Dann bleibt
-                            # die Meldungsliste leer und wir holen dieselbe Session
-                            # noch einmal ueber die Core-Klasse, die den Logger hat.
+                            if ($tapeMsgs.Count -eq 0) {
+                                $fullTapeSession = Resolve-FullSession -Session $latestSession
+                                if ($fullTapeSession) {
+                                    $tapeMsgs = @(Get-DetailMessages -Obj $fullTapeSession -Max 6)
+                                }
+                            }
+
                             if ($tapeMsgs.Count -eq 0) {
                                 try {
                                     $coreSession = @([Veeam.Backup.Core.CBackupSession]::GetByJob($tapeJob.Id) | Sort-Object CreationTime -Descending)[0]
@@ -878,13 +990,29 @@ $VeeamCheckLogic = @'
                                 } catch {}
                             }
 
-                            Add-Messages -Messages $tapeMsgs -Prefix "    > "
+                            # Letzter Ausweg: die letzten Log-Zeilen ungefiltert.
+                            # Besser eine ungenaue Spur als eine leere Warnung.
+                            if ($tapeMsgs.Count -eq 0) {
+                                $tapeMsgs = @(Get-LastLogRecords -Obj $latestSession -Count 4)
+                            }
 
-                            # Einzelne Objekte des Tape-Jobs (Backups/Dateien)
+                            if ($tapeMsgs.Count -eq 0) {
+                                Add-Log "    > (Keine Detailmeldung im Session-Log auslesbar - Ursache bitte in der Veeam-Konsole pruefen.)"
+                            } else {
+                                Add-Messages -Messages $tapeMsgs -Prefix "    > "
+                            }
+
+                            # Einzelne Objekte des Tape-Jobs (Backups/Dateien).
+                            # Oft steckt die Ursache hier statt auf Job-Ebene:
+                            # "Backup XY konnte nicht auf Band geschrieben werden".
                             $tTasks = $null
                             try { $tTasks = $latestSession.GetTaskSessions() } catch {}
                             if (-not $tTasks) {
                                 try { $tTasks = Get-VBRTaskSession -Session $latestSession -ErrorAction SilentlyContinue } catch {}
+                            }
+                            if (-not $tTasks) {
+                                $fts = Resolve-FullSession -Session $latestSession
+                                try { $tTasks = $fts.GetTaskSessions() } catch {}
                             }
                             foreach ($task in $tTasks) {
                                 $tStatus = Get-StatusString -Obj $task
