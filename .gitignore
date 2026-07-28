@@ -1,0 +1,11 @@
+# Windows / OneDrive
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# Office / Editor Temp
+~$*
+*.tmp
+*.bak
+*.swp
