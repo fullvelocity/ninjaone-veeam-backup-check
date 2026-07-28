@@ -34,13 +34,29 @@
 # =============================================================================
 
 # 1. Ninja-Properties abrufen
+#    HINWEIS: Diese vier Werte werden aktuell nur eingelesen, aber nirgends
+#    ausgewertet - die Felder werden am Ende ohnehin komplett neu geschrieben.
+#    Sie stehen hier als Platzhalter, falls spaeter ein Vergleich mit dem
+#    Vorlauf gebraucht wird (z.B. "Status hat sich seit gestern geaendert").
+#    Wer das nicht braucht, kann die vier Zeilen ersatzlos loeschen.
 $successProp = Ninja-Property-Get veeamsuccess
 $warningProp = Ninja-Property-Get veeamwarning
 $failProp    = Ninja-Property-Get veeamfail
 $logProp     = Ninja-Property-Get veeamlog
 
 # -----------------------------------------------------------------------------
-# DER CHECK-CODE (In einem Block, damit er ueberall laufen kann)
+# DER CHECK-CODE
+#
+# Warum steckt die gesamte Logik in einem Here-String statt direkt im Script?
+# Veeam V13 laeuft nur noch unter PowerShell 7. NinjaOne startet Scripts aber
+# in der Regel mit Windows PowerShell 5.1. Der Block muss deshalb wahlweise
+#   a) direkt im aktuellen Prozess ausgefuehrt werden (V10-V12), oder
+#   b) in eine temporaere .ps1 geschrieben und mit pwsh.exe gestartet werden (V13).
+# Das entscheidet der EXECUTION CONTROLLER weiter unten.
+#
+# Der Here-String ist EINFACH quotiert (@'...'@). Damit bleiben alle $-Variablen
+# im Block unveraendert stehen und werden erst beim Ausfuehren aufgeloest.
+# Wichtig: das abschliessende '@ muss in Spalte 1 stehen, sonst bricht das Parsing.
 # -----------------------------------------------------------------------------
 $VeeamCheckLogic = @'
     $WarningPreference = 'SilentlyContinue'
@@ -56,15 +72,27 @@ $VeeamCheckLogic = @'
     $LogListFull    = New-Object System.Collections.Generic.List[string]
     $LogListCompact = New-Object System.Collections.Generic.List[string]
 
-    # Jobnamen die bereits gemeldet wurden (verhindert Doppel-Meldungen)
+    # Jobnamen die bereits gemeldet wurden. Verhindert, dass derselbe Job
+    # zweimal im Log landet - relevant seit Abschnitt 2 (Platform-Jobs), falls
+    # ein Job wider Erwarten doch schon in Abschnitt 1 aufgetaucht ist.
     $HandledJobNames = @{}
 
+    # Zwei Log-Listen fuer das 10.000-Zeichen-Limit von NinjaOne:
+    #   $LogListFull    = alles, inkl. jeder erfolgreich gesicherten VM
+    #   $LogListCompact = dasselbe OHNE die Zeilen erfolgreicher VMs
+    # Wird der Volltext zu lang, faellt automatisch auf die Kurzfassung zurueck.
+    # Deshalb gilt: -IsDetail NUR fuer Zeilen, die man verlieren darf.
+    # Fehlermeldungen niemals mit -IsDetail loggen, sonst fehlt beim grossen
+    # Kunden genau die Information, wegen der man ins Log schaut.
     function Add-Log {
         param([string]$msg, [switch]$IsDetail)
         $LogListFull.Add($msg)
         if (-not $IsDetail) { $LogListCompact.Add($msg) }
     }
 
+    # Die Veeam-Datenbank antwortet unter Last gelegentlich nicht sofort
+    # (Timeouts waehrend laufender Jobs). Deshalb kritische Abfragen wiederholen,
+    # statt den kompletten Check mit einem Fehler abzubrechen.
     function Invoke-WithRetry {
         param([ScriptBlock]$Command, [int]$MaxRetries = 3, [int]$DelaySeconds = 5)
         $retryCount = 0
@@ -85,7 +113,11 @@ $VeeamCheckLogic = @'
     # HILFSFUNKTIONEN FUER KLARTEXT-MELDUNGEN AUS DEM VEEAM-LOG
     # =========================================================================
 
-    # Bereinigt eine Veeam-Meldung (HTML-Tags, Zeilenumbrueche, Laenge)
+    # Bereinigt eine Veeam-Meldung fuer die Ausgabe im NinjaOne-Feld.
+    # Veeam liefert Log-Texte teilweise als HTML-Fragmente ("<b>", "<br>",
+    # "&quot;") und mit eingebetteten Zeilenumbruechen. Beides wuerde das Log
+    # unleserlich machen und unnoetig Zeichen vom 10.000er-Budget fressen.
+    # Ergebnis: eine einzeilige, entschaerfte Meldung, hart auf $MaxLen gekappt.
     function Format-Msg {
         param([string]$Text, [int]$MaxLen = 260)
         if ([string]::IsNullOrEmpty($Text)) { return "" }
@@ -107,17 +139,49 @@ $VeeamCheckLogic = @'
         return $t
     }
 
-    # Nichtssagende Standard-Abschlussmeldungen nach hinten sortieren
+    # Erkennt nichtssagende Standard-Abschlussmeldungen.
+    # Veeam schreibt bei jedem Job mit Problem eine Zeile wie
+    # "Job finished with warning at 03:00" ins Log. Das ist genau die Information,
+    # die man ohnehin schon aus dem Status hat. Solche Zeilen werden nicht
+    # verworfen (sie koennen Zeitangaben enthalten), aber nach hinten sortiert,
+    # damit bei begrenzter Meldungsanzahl die echte Ursache oben steht.
     function Test-IsNoiseMsg {
         param([string]$Text)
         if ([string]::IsNullOrEmpty($Text)) { return $true }
         return ($Text -match '(finished with|completed with|Processing finished|Job finished|abgeschlossen mit)')
     }
 
-    # Holt die eigentlichen Warn-/Fehlermeldungen aus einer Session oder TaskSession
+    # KERNSTUECK: holt die eigentlichen Warn-/Fehlermeldungen im Klartext.
+    #
+    # Das Problem: $session.Result liefert nur "Warning" oder "Failed". Die
+    # Ursache ("No suitable media found", "Tape is not available") steht
+    # ausschliesslich im Session-Log. Die offiziellen Cmdlets geben davon
+    # bestenfalls die oberste Meldung zurueck.
+    #
+    # Deshalb hier eine Kaskade von vier Quellen, von der besten zur schlechtesten.
+    # Sobald eine etwas liefert, wird abgebrochen:
+    #   1) Logger.GetLog().GetAttentionRecords()  -> alle Warn-/Fehler-Records
+    #      Fallback: UpdatedRecords manuell auf EWarning/EFailed filtern,
+    #      da GetAttentionRecords() nicht in jeder Veeam-Version existiert.
+    #   2) GetDetails()      -> Freitext-Begruendung der Session
+    #   3) Info.Reason       -> bei abgebrochenen Sessions gefuellt
+    #   4) Description       -> letzter Strohhalm
+    #
+    # Funktioniert mit Session- UND TaskSession-Objekten, beide haben einen Logger.
+    #
+    # ACHTUNG: Alle Zugriffe sind in try/catch gekapselt, weil Logger, GetDetails()
+    # und Info.Reason INTERNE Veeam-Members sind. Sie sind nicht dokumentiert und
+    # koennen mit einem Update verschwinden. Faellt das aus, bleibt der Job-Status
+    # korrekt, es fehlen nur die Detailzeilen.
+    #
+    # Rueckgabe ist bewusst "return ,$out" (mit fuehrendem Komma): ohne das
+    # wuerde PowerShell die Liste in Einzelobjekte zerlegen und bei genau einer
+    # Meldung einen String statt einer Liste zurueckgeben - .Count waere dann
+    # die Stringlaenge statt 1.
     function Get-DetailMessages {
         param($Obj, [int]$Max = 5)
 
+        # Zwei Toepfe: echte Ursachen zuerst, Standardfloskeln danach
         $primary   = New-Object System.Collections.Generic.List[string]
         $secondary = New-Object System.Collections.Generic.List[string]
         $out       = New-Object System.Collections.Generic.List[string]
@@ -138,6 +202,9 @@ $VeeamCheckLogic = @'
             }
         } catch {}
 
+        # Title = Kurzmeldung, Description = Zusatzinfo. Beide zusammengefuehrt,
+        # weil die eigentliche Ursache mal im einen, mal im anderen Feld steht.
+        # Dedup ueber .Contains(), da bei mehreren VMs oft dieselbe Warnung faellt.
         foreach ($r in $records) {
             $title = ""
             $desc  = ""
@@ -157,6 +224,8 @@ $VeeamCheckLogic = @'
             }
         }
 
+        # Reihenfolge: echte Ursachen zuerst, Standardfloskeln ans Ende.
+        # Wird spaeter auf $Max gekuerzt - so ueberlebt die wichtige Meldung.
         foreach ($p in $primary)   { if (-not $out.Contains($p)) { $out.Add($p) } }
         foreach ($s in $secondary) { if (-not $out.Contains($s)) { $out.Add($s) } }
 
@@ -198,8 +267,14 @@ $VeeamCheckLogic = @'
         return ,$out
     }
 
-    # Holt die letzten N Log-Eintraege (unabhaengig vom Status).
-    # Wichtig fuer laufende/wartende Sessions ("Waiting for tape ...").
+    # Holt die letzten N Log-Eintraege UNABHAENGIG vom Status.
+    #
+    # Gebraucht fuer Sessions, die noch laufen bzw. haengen: dort gibt es oft
+    # noch gar keinen Warn-Record, weil Veeam den Job nicht als fehlgeschlagen
+    # sieht - er wartet ja nur. Die entscheidende Zeile ("Waiting for tape
+    # 'LTO-004' to be inserted") ist dann ein ganz normaler Info-Eintrag.
+    # Get-DetailMessages wuerde hier nichts finden, deshalb dieser Griff auf
+    # die letzten Zeilen des laufenden Logs.
     function Get-LastLogRecords {
         param($Obj, [int]$Count = 3)
         $out = New-Object System.Collections.Generic.List[string]
@@ -225,7 +300,12 @@ $VeeamCheckLogic = @'
         }
     }
 
-    # Ermittelt den Status-String eines Objekts robust ueber mehrere Properties
+    # Ermittelt den Status eines Objekts robust ueber mehrere Properties.
+    #
+    # Je nach Job-Typ und Veeam-Version steckt das Ergebnis in .Result, .State
+    # oder .Status - und bei Platform-Jobs (Proxmox) ist .Result waehrend des
+    # Laufs "None", waehrend .State bereits aussagekraeftig ist. Reihenfolge:
+    # Result -> State -> Status -> "Unknown".
     function Get-StatusString {
         param($Obj)
         $s = ""
@@ -237,6 +317,11 @@ $VeeamCheckLogic = @'
     }
 
     # --- MODULE LADEN ---
+    # Zwei Wege, je nach Veeam-Generation:
+    #   V11+ : Modul "Veeam.Backup.PowerShell"
+    #   V10  : altes PSSnapin "VeeamPSSnapin" (gibt es unter PS7 nicht mehr)
+    # Ist Get-VBRJob danach immer noch nicht da, laeuft das Script auf einer
+    # Maschine ohne Veeam-Konsole und bricht sauber mit Failed ab.
     if (-not (Get-Command Get-VBRJob -ErrorAction SilentlyContinue)) {
         try {
             if (Get-Module -ListAvailable -Name "Veeam.Backup.PowerShell") {
@@ -260,14 +345,27 @@ $VeeamCheckLogic = @'
         return ($res | ConvertTo-Json -Depth 2)
     }
 
-    # Die interne Core-Assembly wird erst durch einen echten VBR-Aufruf geladen.
-    # Ohne das schlaegt [Veeam.Backup.Core.CBackupJob] fehl.
+    # Dummy-Aufruf mit Zweck: das Laden des Moduls allein reicht nicht, die
+    # Assembly Veeam.Backup.Core wird erst durch einen echten Cmdlet-Aufruf in
+    # die AppDomain geladen. Ohne das wirft [Veeam.Backup.Core.CBackupJob] in
+    # Abschnitt 2 einen "type not found"-Fehler und die Proxmox-Erkennung faellt
+    # still aus. Das Cmdlet selbst ist beliebig, es muss nur harmlos sein.
     try { Get-VBRLicenseAutoUpdateStatus -ErrorAction SilentlyContinue | Out-Null } catch {}
 
     # =========================================================================
     # 1. VM BACKUP JOBS
     # =========================================================================
     try {
+        # Ablauf der Pipeline:
+        #   1. alle Sessions holen, nur abgeschlossene ("Stopped") behalten -
+        #      laufende Jobs haben noch kein Ergebnis und wuerden falsch alarmieren
+        #   2. nach Job gruppieren und je Job nur die neueste Session nehmen
+        #   3. Jobs ohne aktiven Zeitplan aussortieren
+        #
+        # ACHTUNG - genau hier fallen Proxmox-Jobs raus: Get-VBRJob kennt sie
+        # nicht, $job ist $null, der Filter liefert $false. Das ist kein Bug in
+        # dieser Zeile, sondern eine Veeam-Einschraenkung. Behandelt wird das
+        # in Abschnitt 2.
         $latestSessions = Invoke-WithRetry -Command {
             Get-VBRBackupSession |
             Where-Object { $_.State -eq "Stopped" } |
@@ -286,26 +384,31 @@ $VeeamCheckLogic = @'
                 $jobStatus = $session.Result
                 $jobTime   = $session.CreationTime.ToString("dd.MM.yyyy HH:mm:ss")
 
+                # Job als erledigt vormerken, damit Abschnitt 2 ihn nicht erneut meldet
                 $HandledJobNames["$jobName"] = $true
 
                 Add-Log "--------------------------------------"
                 Add-Log "Backup-Job: $jobName | Status: $jobStatus | Zeitpunkt: $jobTime"
 
-                # NEU: Klartext-Meldungen auf Job-Ebene
+                # Klartext-Ursache auf Job-Ebene - nur wenn es etwas zu erklaeren gibt.
+                # Bei "Success" spart man sich den teuren Zugriff auf das Session-Log.
                 if ("$jobStatus" -ne "Success") {
                     Add-Messages -Messages (Get-DetailMessages -Obj $session -Max 5) -Prefix "    > "
                 }
 
+                # Einzelne VMs des Jobs. Ein Job kann "Success" sein und trotzdem
+                # eine VM mit Warnung enthalten - deshalb wird immer durchiteriert.
                 $tasks = $session.GetTaskSessions()
                 foreach ($task in $tasks) {
                     $vmName   = $task.Name
                     $vmStatus = Get-StatusString -Obj $task
 
                     if ("$vmStatus" -eq "Success") {
-                        # Erfolgs-Details duerfen bei Platzmangel wegfallen
+                        # -IsDetail: darf bei Platzmangel wegfallen (siehe Add-Log)
                         Add-Log "    - VM: $vmName | Status: $vmStatus" -IsDetail
                     } else {
-                        # NEU: Problem-VMs samt Ursache immer mitloggen
+                        # Problem-VMs OHNE -IsDetail, damit sie samt Ursache
+                        # auch in der gekuerzten Fassung erhalten bleiben
                         Add-Log "    - VM: $vmName | Status: $vmStatus"
                         Add-Messages -Messages (Get-DetailMessages -Obj $task -Max 3) -Prefix "        > "
                     }
@@ -328,11 +431,28 @@ $VeeamCheckLogic = @'
     # 2. PLATFORM BACKUP JOBS
     #    Proxmox VE, Nutanix AHV, oVirt/RHV/OLVM, Scale Computing, Morpheus
     #
-    #    WICHTIG: Diese Jobs liefert Get-VBRJob NICHT zurueck. Deshalb sind sie
-    #    in Abschnitt 1 systematisch durch den Get-VBRJob-Filter gefallen.
+    #    DAS PROBLEM
+    #    Veeam liefert diese Jobs bewusst NICHT ueber Get-VBRJob zurueck (offiziell
+    #    bestaetigt im Veeam-Forum: "Currently, PowerShell is not available for
+    #    Proxmox workloads"). Jedes Script, das seine Sessions ueber
+    #    "Get-VBRJob -Name" gegenprueft, wirft sie damit unbemerkt weg. Genau
+    #    deshalb kamen bei Proxmox-Kunden bisher gar keine Daten an.
+    #
+    #    DIE LOESUNG - zwei Wege, A zuerst, B als Netz
+    #    Weg A: Get-VBRSession -Type PlatformBackupJob      (offiziell, ab V12.3)
+    #    Weg B: [Veeam.Backup.Core.CBackupJob]::GetAll()    (intern, aeltere Staende)
+    #
+    #    Weg B ist von Veeam ausdruecklich NICHT supportet und nur fuer Reporting
+    #    freigegeben - niemals Jobs darueber starten/stoppen/loeschen. Sobald
+    #    Veeam offizielle Proxmox-Cmdlets liefert, kann Weg B ersatzlos raus.
     # =========================================================================
     try {
-        # --- Job-Liste ueber die interne Core-Klasse (Name, Typ, Zeitplan) ----
+        # --- Job-Liste ueber die interne Core-Klasse --------------------------
+        # Liefert Name, Typ und Zeitplan. Wird fuer beides gebraucht:
+        #   - als Datenquelle in Weg B
+        #   - in Weg A nur ergaenzend, um IsScheduleEnabled pruefen zu koennen
+        #     (die Session allein sagt nichts darueber aus, ob der Job noch aktiv ist)
+        # Schlaegt der Zugriff fehl, bleibt die Liste leer und Weg A traegt allein.
         $platformJobs = @()
         try {
             $platformJobs = @([Veeam.Backup.Core.CBackupJob]::GetAll() | Where-Object {
@@ -340,20 +460,37 @@ $VeeamCheckLogic = @'
             })
         } catch {}
 
+        # Nachschlagetabelle JobId -> Job, um spaeter je Session den Job zu finden
         $platformJobById = @{}
         foreach ($pj in $platformJobs) {
             try { $platformJobById["$($pj.Id)"] = $pj } catch {}
         }
 
         # --- Sessions holen: Weg A (offiziell, ab V12.3) ----------------------
+        # Get-VBRSession liefert nur "leichte" Session-Objekte (Id, JobId, Status,
+        # Zeit) - schnell, aber ohne Logger und ohne GetTaskSessions(). Deshalb
+        # hier erst die Kandidaten bestimmen und weiter unten nur diese wenigen
+        # als vollstaendige Session nachladen. Andersherum (alles nachladen) waere
+        # auf Servern mit langer Historie spuerbar langsam.
+        #
+        # -ErrorAction Stop ist Absicht: kennt die installierte Version den Typ
+        # "PlatformBackupJob" noch nicht, gibt es einen Bindungsfehler, den der
+        # catch abfaengt - dann uebernimmt Weg B.
         $platformSessions = @()
         $platformCandidates = @()
         try {
             $rawPlatform = @(Get-VBRSession -Type PlatformBackupJob -ErrorAction Stop)
             if ($rawPlatform.Count -gt 0) {
+                # Normalfall: nur abgeschlossene Sessions bewerten.
+                # Sonderfall: laeuft der allererste Job gerade noch, gibt es keine
+                # einzige "Stopped"-Session - dann lieber den laufenden Stand
+                # melden als gar nichts.
                 $stopped = @($rawPlatform | Where-Object { "$($_.State)" -eq "Stopped" })
                 if ($stopped.Count -eq 0) { $stopped = $rawPlatform }
 
+                # Je Job nur die neueste Session behalten.
+                # Gruppiert wird ueber JobId statt JobName, weil umbenannte Jobs
+                # sonst als zwei getrennte Jobs erscheinen wuerden.
                 $platformCandidates = @(
                     $stopped |
                     Sort-Object CreationTime -Descending |
@@ -371,6 +508,9 @@ $VeeamCheckLogic = @'
         }
 
         # --- Weg B (Fallback ueber Core-Klasse), falls Weg A nichts lieferte ---
+        # Greift bei Versionen ohne "-Type PlatformBackupJob". Hier kommt man vom
+        # Job zur Session statt umgekehrt: FindLastSession() ist der direkte Weg,
+        # GetByJob() der Ersatz, falls die Methode nicht existiert.
         if ($platformSessions.Count -eq 0 -and $platformJobs.Count -gt 0) {
             foreach ($pj in $platformJobs) {
                 $s = $null
@@ -384,29 +524,41 @@ $VeeamCheckLogic = @'
             }
         }
 
+        # Merkt sich, welche Platform-Jobs schon eine Zeile bekommen haben.
+        # Wird unten gebraucht, um Jobs OHNE Session nachzumelden.
         $reportedPlatformJobs = @{}
 
         foreach ($session in $platformSessions) {
             if ($null -eq $session) { continue }
 
+            # Passenden Job zur Session suchen (fuer Name, Typ und Zeitplan).
+            # Bleibt $pjob leer, arbeiten wir nur mit dem, was die Session hergibt.
             $pjob  = $null
             $jobId = ""
             try { $jobId = "$($session.JobId)" } catch {}
             if ($jobId -and $platformJobById.ContainsKey($jobId)) { $pjob = $platformJobById[$jobId] }
 
+            # Jobname: bevorzugt aus der Session, sonst aus dem Job-Objekt.
+            # Je nach Weg (A oder B) ist mal das eine, mal das andere gefuellt.
             $jobName = ""
             try { $jobName = [string]$session.JobName } catch {}
             if ([string]::IsNullOrEmpty($jobName) -and $pjob) { $jobName = [string]$pjob.Name }
             if ([string]::IsNullOrEmpty($jobName)) { $jobName = "<Unbekannt>" }
 
-            # Doppelmeldung vermeiden, falls der Job doch in Abschnitt 1 auftauchte
+            # Doppelmeldung vermeiden - einmal gegen Abschnitt 1, einmal gegen
+            # doppelte Sessions innerhalb dieses Abschnitts
             if ($HandledJobNames.ContainsKey("$jobName")) { continue }
             if ($reportedPlatformJobs.ContainsKey("$jobName")) { continue }
 
-            # Nur aktivierte Jobs, sofern der Zeitplan ermittelbar ist
+            # Deaktivierte Jobs ueberspringen - aber NUR wenn wir den Zeitplan
+            # wirklich kennen. Ohne $pjob lieber melden als stillschweigend
+            # verschlucken; ein Job zu viel im Log ist harmloser als ein
+            # uebersehener Ausfall.
             if ($pjob -and ($pjob.IsScheduleEnabled -eq $false)) { continue }
 
-            # Plattform-Bezeichnung ermitteln (z.B. "Proxmox VE")
+            # Plattform-Bezeichnung fuer die Log-Zeile, z.B. "Proxmox VE-Job: ...".
+            # ToHumanReadable() gibt es nur auf vollstaendigen Sessions (Weg A),
+            # deshalb TypeToString aus dem Job-Objekt als Ersatz (Weg B).
             $platformName = ""
             try { if ($session.Platform) { $platformName = [string]$session.Platform.ToHumanReadable() } } catch {}
             if ([string]::IsNullOrEmpty($platformName) -and $pjob) {
@@ -428,6 +580,9 @@ $VeeamCheckLogic = @'
             }
 
             # --- Einzelne VMs des Platform-Jobs ------------------------------
+            # Zwei Wege, weil es vom Session-Typ abhaengt: vollstaendige Core-
+            # Sessions koennen GetTaskSessions(), die leichten aus Get-VBRSession
+            # nicht - dort muss das Cmdlet Get-VBRTaskSession ran.
             $pTasks = $null
             try { $pTasks = $session.GetTaskSessions() } catch {}
             if (-not $pTasks) {
@@ -454,6 +609,9 @@ $VeeamCheckLogic = @'
         }
 
         # --- Konfigurierte Platform-Jobs ohne jede Session melden -------------
+        # Wichtig fuer den haeufigsten Praxisfall: Proxmox-Job frisch angelegt,
+        # Zeitplan falsch gesetzt, noch nie gelaufen. Ohne diese Schleife stuende
+        # dazu nichts im Log und der Job faellt schlicht nicht auf.
         foreach ($pj in $platformJobs) {
             $pName = ""
             try { $pName = [string]$pj.Name } catch {}
@@ -608,9 +766,14 @@ $VeeamCheckLogic = @'
 
     # =========================================================================
     # 5. TAPE JOBS
-    #    NEU: - Klartext-Ursachen (z.B. "No suitable media found")
-    #         - Erkennung von Sessions die auf ein Band warten (WaitingTape)
-    #         - Fallback auf den Job-Status, wenn keine Session gefunden wird
+    #    Der Abschnitt, der am meisten dazugewonnen hat:
+    #      - Klartext-Ursachen statt nur "Warning"
+    #        (z.B. "No suitable media found", "Tape is not available")
+    #      - Erkennung von Sessions, die auf ein Band warten (WaitingTape).
+    #        Diese erreichen NIE den Zustand "Stopped" und waren deshalb bisher
+    #        voellig unsichtbar - der haeufigste stille Ausfall bei Bandsicherung.
+    #      - Fallback auf den Job-Status, wenn gar keine Session existiert.
+    #        Vorher wurde in dem Fall ueberhaupt nichts geloggt.
     # =========================================================================
     try {
         if (Get-Command Get-VBRTapeJob -ErrorAction SilentlyContinue) {
@@ -620,7 +783,10 @@ $VeeamCheckLogic = @'
                     if ($baseJob) {
                         ($baseJob | Select-Object -First 1).IsScheduleEnabled -eq $true
                     } else {
-                        # Tape-Jobs tauchen in Get-VBRJob i.d.R. nicht auf -> eigenes Enabled-Flag
+                        # Regelfall: Tape-Jobs kennt Get-VBRJob nicht (wie bei
+                        # Proxmox). Dann das Enabled-Flag des Tape-Jobs selbst
+                        # nehmen, statt pauschal jeden Job durchzulassen -
+                        # sonst alarmieren dauerhaft deaktivierte Jobs mit.
                         $_.Enabled -ne $false
                     }
                 }
@@ -630,6 +796,9 @@ $VeeamCheckLogic = @'
                 foreach ($tapeJob in $tapeJobs) {
                     $tapeJobName = $tapeJob.Name
 
+                    # Sessions einmal komplett holen, danach zweimal auswerten
+                    # (abgeschlossen / noch laufend). -Job schlaegt je nach
+                    # Version fehl, deshalb -Name als zweiter Versuch.
                     $allTapeSessions = @()
                     try {
                         $allTapeSessions = @(Invoke-WithRetry -Command { Get-VBRTapeBackupSession -Job $tapeJob -ErrorAction SilentlyContinue })
@@ -640,18 +809,23 @@ $VeeamCheckLogic = @'
                         } catch {}
                     }
 
+                    # Auswertung 1: letzter abgeschlossener Lauf -> normaler Status
                     $latestSession = $null
                     try {
                         $latestSession = @($allTapeSessions | Where-Object { "$($_.State)" -eq "Stopped" } | Sort-Object CreationTime -Descending)[0]
                     } catch {}
 
-                    # --- Laufende Session, die auf ein Band wartet -------------
+                    # Auswertung 2: laeuft gerade noch etwas?
                     $activeSession = $null
                     try {
                         $activeSession = @($allTapeSessions | Where-Object { "$($_.State)" -ne "Stopped" } | Sort-Object CreationTime -Descending)[0]
                     } catch {}
 
                     if ($null -ne $activeSession) {
+                        # Nur haengende Zustaende melden, kein normal laufender Job.
+                        # Der Zustandsname unterscheidet sich je nach Version
+                        # (WaitingTape, WaitingRepository, Idle, Pending), deshalb
+                        # ein Muster statt eines festen Vergleichs.
                         $activeState = "$($activeSession.State)"
                         if ($activeState -match 'Wait|Idle|Pending') {
                             $aTime = "<unbekannt>"
@@ -660,6 +834,10 @@ $VeeamCheckLogic = @'
                             Add-Log "--------------------------------------"
                             Add-Log "Tape-Job: $tapeJobName | Status: WARTET ($activeState) | Start: $aTime"
 
+                            # Ein wartender Job hat meist noch keinen Warn-Record.
+                            # Deshalb: erst regulaer versuchen, sonst die letzten
+                            # Log-Zeilen nehmen - dort steht die Aufforderung
+                            # ("Waiting for tape 'LTO-004' to be inserted").
                             $waitMsgs = @(Get-DetailMessages -Obj $activeSession -Max 3)
                             if ($waitMsgs.Count -eq 0) {
                                 $waitMsgs = @(Get-LastLogRecords -Obj $activeSession -Count 3)
@@ -667,6 +845,9 @@ $VeeamCheckLogic = @'
                             Add-Messages -Messages $waitMsgs -Prefix "    > "
                             Add-Log "    > Hinweis: Job wartet auf Benutzeraktion (z.B. Band einlegen / Medium wechseln)."
 
+                            # Bewusst nur Warning, nicht Failed: der Job ist nicht
+                            # fehlgeschlagen, er braucht Handarbeit. Wer das haerter
+                            # bewerten will, setzt hier zusaetzlich $res.Failed.
                             $res.Warning = $true
                         }
                     }
@@ -679,12 +860,17 @@ $VeeamCheckLogic = @'
                         Add-Log "--------------------------------------"
                         Add-Log "Tape-Job: $tapeJobName | Status: $tapeStatus | Zeitpunkt: $tapeTime"
 
-                        # NEU: die eigentliche Ursache aus dem Session-Log
+                        # HIER kommt die eigentliche Ursache her - genau das, was
+                        # vorher fehlte. Max 6 statt 3, weil ein Tape-Job gern
+                        # mehrere zusammenhaengende Meldungen produziert
+                        # (Medium fehlt -> Pool leer -> Job abgebrochen).
                         if ("$tapeStatus" -ne "Success") {
                             $tapeMsgs = @(Get-DetailMessages -Obj $latestSession -Max 6)
 
-                            # Fallback: manche Wrapper-Objekte haben keinen Logger ->
-                            # Session direkt ueber die Core-Klasse nachladen
+                            # Fallback: Get-VBRTapeBackupSession liefert je nach
+                            # Version ein Wrapper-Objekt OHNE Logger. Dann bleibt
+                            # die Meldungsliste leer und wir holen dieselbe Session
+                            # noch einmal ueber die Core-Klasse, die den Logger hat.
                             if ($tapeMsgs.Count -eq 0) {
                                 try {
                                     $coreSession = @([Veeam.Backup.Core.CBackupSession]::GetByJob($tapeJob.Id) | Sort-Object CreationTime -Descending)[0]
@@ -715,7 +901,12 @@ $VeeamCheckLogic = @'
                         if ($tapeStatus -eq "None")    { $res.Failed  = $true }
                     }
                     elseif ($null -eq $activeSession) {
-                        # NEU: bisher wurde hier gar nichts gemeldet (stille Luecke)
+                        # Weder abgeschlossene noch laufende Session.
+                        # Diese Konstellation blieb frueher voellig unkommentiert -
+                        # der Tape-Job fehlte dann einfach im Log. Jetzt wird
+                        # ersatzweise der am Job hinterlegte LastResult gemeldet.
+                        # Die elseif-Bedingung verhindert eine zweite Zeile, wenn
+                        # oben bereits "WARTET" ausgegeben wurde.
                         $tapeJobResult = ""
                         try { $tapeJobResult = [string]$tapeJob.LastResult } catch {}
 
@@ -760,7 +951,10 @@ $VeeamCheckLogic = @'
                     Add-Log "--------------------------------------"
                     Add-Log "M365-Job: $jobName | Status: $jobStatus | Zeitpunkt: $jobTime"
 
-                    # NEU: Klartext aus dem VBO-Sessionlog
+                    # Klartext aus dem VBO-Sessionlog.
+                    # M365 hat eine eigene API: kein Logger-Objekt, sondern eine
+                    # fertige .Log-Liste an der Session. Deshalb hier von Hand
+                    # statt ueber Get-DetailMessages.
                     if ("$jobStatus" -ne "Success") {
                         $vboMsgs = New-Object System.Collections.Generic.List[string]
                         try {
@@ -788,6 +982,8 @@ $VeeamCheckLogic = @'
         Add-Log "Veeam M365-Modul nicht installiert."
     }
 
+    # Kein einziger Abschnitt hat etwas geliefert -> als Fehler werten.
+    # Sonst meldet das Script "alles gut", obwohl es nichts geprueft hat.
     if ($LogListFull.Count -eq 0) {
         Add-Log "Keine Backup-Daten gefunden."
         $res.Failed = $true
@@ -795,8 +991,15 @@ $VeeamCheckLogic = @'
 
     # =========================================================================
     # LOG KOMPRIMIERUNG BEI BEDARF
-    # Stufe 1: Volltext inkl. aller erfolgreichen VMs
-    # Stufe 2: erfolgreiche VM-Zeilen raus, Fehlermeldungen bleiben erhalten
+    #
+    # NinjaOne-Felder fassen 10.000 Zeichen. Zwei Stufen:
+    #   Stufe 1: Volltext inkl. jeder erfolgreich gesicherten VM
+    #   Stufe 2: erfolgreiche VM-Zeilen raus - Job-Header und ALLE
+    #            Fehlermeldungen bleiben erhalten
+    #
+    # Die Schwelle liegt bei 9000, nicht 10.000: der Controller haengt unten
+    # noch einen Hinweistext an, und JSON-Escaping kann die Laenge zusaetzlich
+    # veraendern. Der Puffer verhindert, dass mitten in einer Meldung gekappt wird.
     # =========================================================================
     $fullLogText = $LogListFull -join "`n"
 
@@ -813,13 +1016,28 @@ $VeeamCheckLogic = @'
 
 # -----------------------------------------------------------------------------
 # EXECUTION CONTROLLER
+#
+# Entscheidet, WIE der Logik-Block oben ausgefuehrt wird:
+#   1. Laesst sich Veeam im aktuellen Prozess ansprechen (SnapIn oder Modul)?
+#      -> "Native": Block direkt als Scriptblock ausfuehren. Schnellster Weg.
+#   2. Sonst -> "Modern": Veeam V13 braucht PowerShell 7, NinjaOne startet aber
+#      meist Windows PowerShell 5.1. Der Block wird in eine temporaere .ps1
+#      geschrieben und mit pwsh.exe gestartet.
+# Beide Wege liefern dasselbe JSON zurueck, die Auswertung darunter ist identisch.
 # -----------------------------------------------------------------------------
 
 $finalResult = $null
 $debugLog = ""
 $nativeCapable = $false
 
-# Extrahiert das JSON-Objekt aus einer evtl. verrauschten Ausgabe
+# Schneidet das JSON aus einer moeglicherweise verrauschten Ausgabe heraus.
+#
+# Hintergrund: Der Logik-Block soll genau einen JSON-String zurueckgeben. In der
+# Praxis kann sich aber Fremdausgabe dazwischenmogeln (Veeam-Modul-Banner,
+# Warnungen, Fortschrittstext von pwsh). ConvertFrom-Json bricht dann mit
+# "Invalid JSON primitive" ab - und das Script meldete komplett "fehlgeschlagen",
+# obwohl die Daten da waren. Deshalb: alles von der ersten '{' bis zur letzten
+# '}' nehmen und den Rest verwerfen.
 function Get-JsonPayload {
     param($RawOutput)
     if ($null -eq $RawOutput) { return $null }
@@ -872,9 +1090,15 @@ if ($nativeCapable) {
     if ($pwshPath) {
         Write-Host "PowerShell 7 gefunden: $pwshPath"
 
+        # Umweg ueber eine Datei, weil sich der Block als -Command-Argument an
+        # der Zitierung zerlegen wuerde. GUID im Namen, damit parallele Laeufe
+        # sich nicht gegenseitig die Datei ueberschreiben.
         $tempScriptPath = Join-Path $env:TEMP "VeeamCheck_$(New-Guid).ps1"
         Set-Content -Path $tempScriptPath -Value $VeeamCheckLogic -Encoding UTF8
 
+        # -NoProfile:      Profilskripte koennten Text ausgeben und das JSON stoeren
+        # -NonInteractive: nie auf eine Eingabe warten, das Script laeuft unbeaufsichtigt
+        # 2>$null:         stderr verwerfen, damit nur das JSON uebrig bleibt
         $jsonOutput = & $pwshPath -NoProfile -NonInteractive -File $tempScriptPath 2>$null
         Remove-Item -Path $tempScriptPath -Force -ErrorAction SilentlyContinue
 
@@ -892,6 +1116,16 @@ if ($nativeCapable) {
 
 # -----------------------------------------------------------------------------
 # OUTPUT AN NINJA
+#
+# Die drei Flags sind bewusst NICHT exklusiv: ein Server kann gleichzeitig
+# erfolgreiche und fehlgeschlagene Jobs haben. In NinjaOne deshalb zuerst auf
+# veeamfail pruefen, dann auf veeamwarning - sonst uebertoent ein einzelner
+# erfolgreicher Job den Ausfall daneben.
+#
+# ACHTUNG - laeuft das Script nicht (Maschine aus, Agent offline), behalten die
+# Felder ihre ALTEN Werte. Ein Ausfall sieht dann im Dashboard weiter gruen aus.
+# Dagegen hilft nur eine separate NinjaOne-Condition auf "Device Offline" bzw.
+# "Last Contact", das Script selbst kann das nicht abfangen.
 # -----------------------------------------------------------------------------
 
 if ($finalResult) {
@@ -900,12 +1134,17 @@ if ($finalResult) {
     $hasFailed  = [bool]$finalResult.Failed
     $logContent = $finalResult.Log
 } else {
+    # Kein verwertbares Ergebnis -> bewusst als Fehler melden, nicht als "unbekannt".
+    # Ein stiller Nicht-Lauf ist gefaehrlicher als ein Fehlalarm.
     $hasSuccess = $false
     $hasWarning = $false
     $hasFailed  = $true
     $logContent = $debugLog + "`nSkript fehlgeschlagen."
 }
 
+# Letzte Reissleine vor dem 10.000-Zeichen-Limit des Feldes. Greift nur, wenn
+# schon die Kurzfassung aus dem Logik-Block zu lang war (sehr viele Jobs mit
+# Fehlermeldungen). Der Hinweis macht sichtbar, dass etwas fehlt.
 if ($logContent.Length -gt 9800) {
     $logContent = $logContent.Substring(0, 9700) + "`n... [WEITERE DATEN ABGESCHNITTEN (10.000 ZEICHEN LIMIT)]"
 }
